@@ -1,0 +1,94 @@
+!pip install gradio pandas rapidfuzz PyPDF2 python-docx -q
+
+import gradio as gr
+import pandas as pd
+import re
+from rapidfuzz import fuzz
+from PyPDF2 import PdfReader
+from docx import Document
+
+# --- File reading functions ---
+def read_any_file(file):
+    """Reads CSV, Excel, Word, PDF files"""
+    if file.name.endswith(".csv"):
+        return pd.read_csv(file.name)
+    elif file.name.endswith((".xls", ".xlsx")):
+        return pd.read_excel(file.name)
+    elif file.name.endswith(".pdf"):
+        reader = PdfReader(file)
+        text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        data = [re.split(r"\s{2,}|\t|,|;", line.strip()) for line in text.split("\n") if line.strip()]
+        return pd.DataFrame(data)
+    elif file.name.endswith(".docx"):
+        doc = Document(file)
+        lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        data = [re.split(r"\s{2,}|\t|,|;", line) for line in lines]
+        return pd.DataFrame(data)
+    else:
+        raise ValueError(f"Unsupported file type: {file.name}")
+
+# --- Smart data check function ---
+def smart_data_check(files):
+    if not files:
+        return "No file uploaded.", None, None
+
+    all_data = []
+    for f in files:
+        try:
+            df = read_any_file(f)
+            df["source"] = f.name
+            all_data.append(df)
+        except Exception as e:
+            return f"Error reading {f.name}: {e}", None, None
+
+    df = pd.concat(all_data, ignore_index=True)
+    df = df.fillna("").astype(str)
+
+    # Check for exact duplicates
+    duplicated_rows = df[df.duplicated(keep=False)]
+
+    # Check for similar values (fuzzy matching)
+    flat_values = df.drop(columns=["source"]).values.flatten()
+    similar_pairs = []
+    for i in range(len(flat_values)):
+        for j in range(i + 1, len(flat_values)):
+            score = fuzz.token_sort_ratio(flat_values[i], flat_values[j])
+            if score > 90 and flat_values[i] != "" and flat_values[j] != "":
+                similar_pairs.append((flat_values[i], flat_values[j], score))
+
+    if duplicated_rows.empty and not similar_pairs:
+        return "Data is clean - no duplicates or similarities found.", "", ""
+
+    result_duplicates = (
+        "No duplicate rows found." if duplicated_rows.empty
+        else duplicated_rows.to_markdown(index=False)
+    )
+
+    result_similar = (
+        "No similar values found."
+        if not similar_pairs
+        else "\n".join([f"{a} ↔ {b} ({s}%)" for a, b, s in similar_pairs])
+    )
+
+    summary = f"""
+Checked {len(df)} records
+Duplicate rows: {len(duplicated_rows)}
+Similar values: {len(similar_pairs)}
+"""
+    return summary, result_duplicates, result_similar
+
+
+# --- Gradio interface ---
+interface = gr.Interface(
+    fn=smart_data_check,
+    inputs=gr.File(label="Upload any data file (CSV, Excel, PDF, Word)", file_count="multiple"),
+    outputs=[
+        gr.Textbox(label="Summary"),
+        gr.Textbox(label="Duplicate Rows"),
+        gr.Textbox(label="Highly Similar Data"),
+    ],
+    title="Smart Data Checker",
+    description="A tool that reviews any data file to detect duplicate and similar values and ensure data integrity.",
+)
+
+interface.launch(share=False)
